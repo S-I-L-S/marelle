@@ -360,6 +360,37 @@ impl Client {
         })
     }
 
+    /// Discovers model ids exposed by this provider's standard models endpoint.
+    ///
+    /// Discovery is deliberately best-effort at the call site: providers may
+    /// disable this endpoint, expose only a partial catalogue, or require a
+    /// separate account entitlement. A failed discovery must not prevent a
+    /// user from selecting a model they already know by name.
+    pub async fn models(&self) -> Result<Vec<String>, ProviderError> {
+        let url = models_endpoint(&self.provider);
+        let response = self
+            .http
+            .get(url)
+            .header(ACCEPT, "application/json")
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            .map_err(transport)?;
+        if !response.status().is_success() {
+            return Err(self.scrubbed(http_error(response).await));
+        }
+        let body = read_whole(response)
+            .await
+            .map_err(|error| self.scrubbed(error))?;
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|_| protocol("the model catalogue was not valid JSON"))?;
+        let models = model_ids(&value);
+        if models.is_empty() {
+            return Err(protocol("the provider returned no model ids"));
+        }
+        Ok(models)
+    }
+
     /// Sends the request and waits for the whole answer.
     ///
     /// Pieces of the answer are passed to `sink` as they arrive. A sink that
@@ -454,6 +485,72 @@ impl Client {
             other => other,
         }
     }
+}
+
+/// Builds a plain client for background jobs that never carry a key, such as
+/// the update check. It shares the TLS roots, the proxy setting and the
+/// connect timeout with the chat client, and adds a whole-request `timeout`
+/// so a slow mirror cannot hold a session hostage.
+pub fn plain_client(
+    network: &NetworkSettings,
+    timeout: Duration,
+) -> Result<reqwest::Client, ProviderError> {
+    let mut builder = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls_config(&network.extra_roots)?)
+        .http1_only()
+        // Same stance as the chat client: a redirect is a host the user
+        // never named, so it is not followed.
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(network.connect_timeout)
+        .read_timeout(timeout)
+        .timeout(timeout)
+        .user_agent(USER_AGENT);
+    builder = match &network.proxy {
+        ProxySetting::System => builder,
+        ProxySetting::None => builder.no_proxy(),
+        ProxySetting::Url(text) => {
+            let proxy = reqwest::Proxy::all(text.as_str())
+                .map_err(|_| SettingError::new(PROXY_KEY, Expected::Proxy))?;
+            builder.proxy(proxy)
+        }
+    };
+    builder.build().map_err(transport)
+}
+
+/// The conventional model-list endpoint for the provider's wire protocol.
+fn models_endpoint(provider: &ProviderConfig) -> String {
+    let base = provider.base_url.trim_end_matches('/');
+    match provider.kind {
+        crate::config::ProviderKind::OpenAiCompatible => format!("{base}/models"),
+        crate::config::ProviderKind::Anthropic if base.ends_with("/v1") => {
+            format!("{base}/models")
+        }
+        crate::config::ProviderKind::Anthropic => format!("{base}/v1/models"),
+    }
+}
+
+/// Reads common OpenAI-compatible and Anthropic model-list response shapes.
+fn model_ids(value: &Value) -> Vec<String> {
+    let rows = value
+        .as_array()
+        .or_else(|| value.get("data").and_then(Value::as_array))
+        .or_else(|| value.get("models").and_then(Value::as_array));
+    let Some(rows) = rows else {
+        return Vec::new();
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    for row in rows.iter().take(5_000) {
+        let id = row
+            .get("id")
+            .or_else(|| row.get("name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        if let Some(id) = id {
+            ids.insert(id.to_owned());
+        }
+    }
+    ids.into_iter().collect()
 }
 
 /// A request ready to send, with the decoder that will read its answer.
@@ -955,5 +1052,48 @@ BAMCA0kAMEYCIQDmxxbLFrVSrxAe2UrVRQso2S+2DK+o/L4IPSGVORhevgIhAPtg
         ] {
             assert_eq!(is_local(&Url::parse(url).unwrap()), local, "{url}");
         }
+    }
+
+    #[test]
+    fn model_endpoint_respects_versioned_and_unversioned_bases() {
+        let mut provider = ProviderConfig {
+            name: "test".to_owned(),
+            kind: crate::config::ProviderKind::OpenAiCompatible,
+            base_url: "https://example.test/v1".to_owned(),
+            api_key_env: None,
+            api_key_file: None,
+            auth: AuthStyle::None,
+            max_tokens_field: MaxTokensField::MaxTokens,
+            stream_usage: true,
+            extra_body: serde_json::Map::new(),
+        };
+        assert_eq!(models_endpoint(&provider), "https://example.test/v1/models");
+        provider.base_url = "https://example.test/api/paas/v4".to_owned();
+        assert_eq!(
+            models_endpoint(&provider),
+            "https://example.test/api/paas/v4/models"
+        );
+        provider.kind = crate::config::ProviderKind::Anthropic;
+        provider.base_url = "https://example.test".to_owned();
+        assert_eq!(models_endpoint(&provider), "https://example.test/v1/models");
+    }
+
+    #[test]
+    fn model_catalog_accepts_openai_and_anthropic_shapes_and_deduplicates() {
+        let value = serde_json::json!({
+            "data": [
+                {"id": "zeta"},
+                {"id": "alpha"},
+                {"id": "zeta"},
+                {"display_name": "ignored"},
+                {"id": "  "}
+            ]
+        });
+        assert_eq!(
+            model_ids(&value),
+            vec!["alpha".to_owned(), "zeta".to_owned()]
+        );
+        let anthropic = serde_json::json!({"data": [{"id": "claude-sonnet"}]});
+        assert_eq!(model_ids(&anthropic), vec!["claude-sonnet".to_owned()]);
     }
 }
